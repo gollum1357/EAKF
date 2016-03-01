@@ -1,0 +1,359 @@
+---
+title: "Test of KF algorithms on a linear system"
+author: "Aaron A. King, Masoud Mirmomeni"
+date: "19 February 2016"
+output: 
+  html_document:
+    toc: true
+---
+
+```{r knitr-opts,include=FALSE,purl=FALSE}
+require(knitr)
+opts_chunk$set(cache=TRUE,cache.extra=rand_seed)
+set.seed(1659125922)
+```
+
+```{r prelims,message=FALSE,cache=FALSE}
+require(ggplot2)
+require(scales)
+theme_set(theme_bw())
+require(reshape2)
+require(plyr)
+require(magrittr)
+require(mvtnorm)
+require(pomp)
+```
+
+## The linear model
+
+Observation times:
+```{r timespan}
+t <- seq(1,100)
+```
+
+
+The observation matrix is $C\in \mathbb{R}^{n\times m}$.
+
+```{r obs-matrix}
+C <- matrix(c(0, 1,  0, 0,
+              0, 1, -1, 0),
+            2,4,byrow=TRUE); 
+dimX <- ncol(C)
+dimY <- nrow(C)
+rownames(C) <- paste0("y",seq_len(dimY))
+colnames(C) <- paste0("x",seq_len(dimX))
+C
+```
+
+The state transition matrix is $A\in\mathbb{R}^{m\times m}$.
+```{r proc-mean}
+# A <- matrix(c(-0.677822, -0.169411,  0.420662,  0.523571,
+#                2.87451,  -0.323604, -0.489533, -0.806087,
+#               -1.36617,  -0.592326,  0.567114,  0.345142,
+#               -0.807978, -0.163305,  0.668037,  0.468286),
+#             nrow=dimX,ncol=dimX,byrow=TRUE,
+#             dimnames=list(colnames(C),colnames(C)))
+A <- matrix(c(-0.677822, -0.169411,  0.420662, 0,
+               2.87451,  -0.323604, -0.489533, 0,
+              -1.36617,  -0.592326,  0.567114, 0,
+              -0.807978, -0.163305,  0.668037, 0.468286),
+            nrow=dimX,ncol=dimX,byrow=TRUE,
+            dimnames=list(colnames(C),colnames(C)))
+A
+```
+
+The process noise covariance matrix, $Q\in\mathbb{R}^{m\times m}$.
+```{r proc-noise}
+Q <- 10*diag(1,dimX)
+dimnames(Q) <- dimnames(A)
+Q
+```
+
+The observation noise covariance matrix, $R\in\mathbb{R}^{n\times n}$.
+```{r obs-noise}
+R <- 1*matrix(c(1,0.5,0.5,3),nrow=dimY)
+dimnames(R) <- list(rownames(C),rownames(C))
+R
+```
+
+The initial state, $X_0\in\mathbb{R}^{m}$.
+```{r x0}
+X0 <- setNames(rnorm(4),colnames(C))
+X0
+```
+
+Now to simulate some data.
+```{r generate-data}
+N <- length(t)
+
+x <- array(dim=c(dimX,N),dimnames=list(vbl=colnames(C),time=t))
+y <- array(dim=c(dimY,N),dimnames=list(vbl=rownames(C),time=t))
+
+xx <- X0
+sqrtQ <- chol(Q)
+sqrtR <- chol(R)
+for (k in seq_along(t)) {
+  x[,k] <- xx <- A %*% xx + sqrtQ %*% rnorm(n=dimX)
+  y[,k] <- C %*% xx + sqrtR %*% rnorm(n=dimY)
+}
+```
+
+Plot the data and true states:
+```{r plot-data}
+melt(list(obs=y,states=x)) %>%
+  ggplot(aes(x=time,y=value,group=vbl))+
+  geom_line()+
+  facet_grid(vbl~.,scales='free_y')+
+  theme(legend.position="top")+
+  labs(color=NULL)
+```
+
+## Kalman filter (KF)
+
+Prediction mean: $M_t=A\,m_t$  
+Prediction variance: $V_t=A\,v_t\,A^T+Q$  
+Forecast error: $r_t=y_t-C\,M_t$  
+Forecast error variance: $W_t=C\,V_t\,C^T+R$  
+Filter variance: $v_t=(V_t^{-1}+C^T\,R^{-1}\,C)^{-1}$  
+Kalman gain: $K_t=v_t\,C^T\,R^{-1}$  
+Filter mean: $m_t=M_t+K_t\,r_t$  
+
+```{r define-kf}
+kalmanFilter <- function (y, X0, A, Q, C, R) {
+  N <- ncol(y)
+  dimX <- length(X0)
+  filterMeans <- array(dim=c(dimX,N),dimnames=dimnames(x))
+  predMeans <- array(dim=c(dimX,N),dimnames=dimnames(x))
+  forecast <- array(dim=c(dimY,N),dimnames=dimnames(y))
+  condlogLik <- numeric(N)
+  ri <- solve(R)
+  cric <- crossprod(C,ri)%*%C
+  fm <- X0
+  fv <- matrix(0,dimX,dimX)
+  for (k in seq_along(t)) {
+    predMeans[,k] <- pm <- A%*%fm      # prediction mean
+    pv <- A%*%tcrossprod(fv,A)+Q       # prediction variance    
+    svdV <- svd(pv,nv=0)
+    resid <- y[,k]-C%*%pm              # forecast error
+    w <- tcrossprod(C%*%pv,C)+R        # forecast variance
+    svdW <- svd(w,nv=0)
+    condlogLik[k] <- sum(dnorm(x=crossprod(svdW$u,resid),mean=0,sd=sqrt(svdW$d),log=TRUE))
+    pvi <- svdV$u%*%(t(svdV$u)/svdV$d) # prediction precision
+    fvi <- pvi+cric                    # filter precision
+    svdv <- svd(fvi,nv=0)
+    fv <- svdv$u%*%(t(svdv$u)/svdv$d)  # filter variance
+    K <- fv%*%crossprod(C,ri)          # Kalman gain
+    filterMeans[,k] <- fm <- pm+K%*%resid  # filter mean
+    forecast[,k] <- C %*% pm
+  }
+  list(filterMeans=filterMeans,predMeans=predMeans,forecast=forecast,condlogLik=condlogLik)
+}
+```
+
+```{r run-kf}
+kf <- kalmanFilter(y,X0,A,Q,C,R)
+```
+
+Plot the results:
+```{r plot-kf,warning=FALSE}
+melt(list(obs=list(true=y,pred=kf$forecast),
+          states=list(true=x,filter=kf$filterMeans,pred=kf$predMeans))) %>%
+  dcast(vbl+time~L2) %>%
+  ggplot(aes(x=time))+
+  geom_point(aes(y=true),color='black')+
+  geom_point(aes(y=pred),color='red',alpha=0.5)+
+  geom_line(aes(y=filter),color='blue',alpha=0.3)+
+  facet_grid(vbl~.,scales='free_y')+
+  theme(legend.position="top")
+```
+
+## Particle filter (PF)
+
+```{r pfilter}
+require(pomp)
+require(mvtnorm)
+y %>% melt() %>% dcast(time~vbl) %>%
+  pomp(times='time',t0=0,
+       rprocess=discrete.time.sim(
+         step.fun=function(x,t,params,...){
+           A%*%x+sqrtQ%*%rnorm(n=dimX)
+         },
+         delta.t=1),
+       rmeasure=function(x,t,params,...){
+         C%*%x+sqrtR%*%rnorm(n=dimY)
+       },
+       dmeasure=function(y,x,t,params,log,...){
+         dmvnorm(x=t(y-C%*%x),sigma=R,log=log)
+       },
+       initializer=function(params,t0,...){
+         X0
+       },
+       params=c(dummy=3)) %>%
+  pfilter(Np=2000,filter.mean=TRUE) -> pf
+```
+
+## Ensemble Kalman Filter (EnKF)
+
+Ensemble: $X_t\in \mathbb{R}^{m\times q}$  
+Prediction mean: $M_t=\langle X \rangle$  
+Prediction variance: $V_t=\langle\langle X \rangle\rangle$  
+Forecast: $Y_t=C\,X_t$  
+Forecast mean: $N_t=\langle Y \rangle$.  
+Forecast variance: $S_t=\langle\langle Y \rangle\rangle$  
+State/forecast covariance: $W_t=\langle\langle X,Y\rangle\rangle$  
+Kalman gain: $K_t = W_t\,S_t^{-1}$  
+New observation: $y_t\in \mathbb{R}^{n\times 1}$  
+Updated ensemble: $X^u_{t}=X_t + K_t\,(O_t - Y_t)$  
+Filter mean: $m_t=\langle X^u_t \rangle = \frac{1}{q} \sum\limits_{i=1}^q x^{u_i}_t$  
+
+```{r define-enkf}
+ensembleKalmanFilter <- function (y, X0, A, Q, C, R, Np) {
+  N <- ncol(y)
+  dimX <- length(X0)
+  X <- array(X0,dim=c(dimX,Np),dimnames=list(vbl=colnames(C),particle=seq_len(Np)))
+  filterMeans <- array(dim=c(dimX,N),dimnames=dimnames(x))
+  predMeans <- array(dim=c(dimX,N),dimnames=dimnames(x))
+  forecast <- array(dim=c(dimY,N),dimnames=dimnames(y))
+  condlogLik <- numeric(N)
+  tt <- c(0,t)
+  for (k in seq_along(t)) {
+    ## advance ensemble according to state process
+    X[,] <- rprocess(pf,xstart=X,times=tt[c(k,k+1)],params=coef(pf),offset=1)
+    predMeans[,k] <- pm <- rowMeans(X) # prediction mean
+    ym <- C%*%pm                  # forecast mean
+    vx <- var(t(X))               # prediction variance
+    vy <- tcrossprod(C%*%vx,C)+R  # forecast variance
+    vyx <- C%*%vx                 # forecast/state covariance
+    Kt <- solve(vy,vyx)           # Kalman gain (transposed)
+    Ek <- sqrtR %*% matrix(rnorm(n=dimY*Np),dimY,Np)
+    X <- X+crossprod(Kt,y[,k]+Ek-C%*%X)
+    resid <- y[,k]-ym
+    svdS <- svd(vy,nv=0)
+    condlogLik[k] <- sum(dnorm(x=crossprod(svdS$u,resid),mean=0,sd=sqrt(svdS$d),log=TRUE))
+    filterMeans[,k] <- fm <- rowMeans(X)         # filter mean
+    forecast[,k] <- ym
+  }
+  list(filterMeans=filterMeans,predMeans=predMeans,
+       forecast=forecast,condlogLik=condlogLik)
+}
+```
+
+```{r run-enkf}
+enkf <- ensembleKalmanFilter(y,X0,A,Q,C,R,Np=100)
+```
+
+Plot the results:
+```{r plot-enkf,warning=FALSE}
+melt(list(obs=list(true=y,pred=enkf$forecast),
+          states=list(true=x,filter=enkf$filterMeans,pred=enkf$predMeans))) %>%
+  dcast(vbl+time~L2) %>%
+  ggplot(aes(x=time))+
+  geom_point(aes(y=true),color='black')+
+  geom_point(aes(y=pred),color='red',alpha=0.5)+
+  geom_line(aes(y=filter),color='blue',alpha=0.3)+
+  facet_grid(vbl~.,scales='free_y')+
+  theme(legend.position="top")
+```
+
+## Ensemble adjustment Kalman filter (EAKF)
+
+Ensemble: $X_t\in \mathbb{R}^{m\times q}$  
+Prediction mean: $M_t=\langle X \rangle$ (ensemble average).  
+Prediction variance: $V_t=\langle\langle X \rangle\rangle$ (ensemble variance).  
+SVD of prediction variance: $V = Q_{V}\,D_{V}\,Q_{V}^T$  
+Another SVD: $U=D_V^{1/2}\,Q_V^T\,C^T\,R^{-1}\,C\,Q_V\,D_V^{1/2}=Q_U\,D_U\,Q_U^T$  
+Adjustment: $B=Q_V\,D_V^{1/2}\,Q_U\,(I+D_U)^{-1/2}\,D_V^{-1/2}\,Q_V^T$  
+Kalman gain: $K=B\,V\,B^T\,C^T\,R^{-1}$  
+Filter mean: $m_t=M_t+K_t\,(y_t-C\,M_t)$  
+Updated ensemble: $x_{t}=B\,(X_t-M_t\,\mathbb{1})+m_t\,\mathbb{1}$  
+
+```{r define-eakf}
+ensAdjKalmanFilter <- function (y, X0, A, Q, C, R, Np) {
+  N <- ncol(y)
+  dimX <- length(X0)
+  ## X is the ensemble
+  X <- array(X0,dim=c(dimX,Np),dimnames=list(vbl=colnames(C),particle=seq_len(Np)))
+  filterMeans <- array(dim=c(dimX,N),dimnames=dimnames(x))
+  predMeans <- array(dim=c(dimX,N),dimnames=dimnames(x))
+  forecast <- array(dim=c(dimY,N),dimnames=dimnames(y))
+  condlogLik <- numeric(N)
+  ri <- solve(R)
+  tt <- c(0,t)
+  for (k in seq_along(t)) {
+    # advance ensemble according to state process
+    X[,] <- rprocess(pf,xstart=X,times=tt[c(k,k+1)],params=coef(pf),offset=1)
+    predMeans[,k] <- pm <- rowMeans(X) # prediction mean
+    X <- X - pm
+    pv <- tcrossprod(X,X)/(ncol(X)-1)  # prediction variance
+    svdV <- svd(pv,nv=0)
+    resid <- y[,k]-C%*%pm              # forecast error
+    w <- t(C%*%svdV$u)
+    w <- crossprod(w,svdV$d*w)+R       # forecast variance
+    svdW <- svd(w,nv=0)
+    condlogLik[k] <- sum(dnorm(x=crossprod(svdW$u,resid),mean=0,sd=sqrt(svdW$d),log=TRUE))
+    u <- sqrt(svdV$d)*t(C%*%svdV$u)
+    u <- tcrossprod(u%*%ri,u)
+    svdU <- svd(u,nv=0)
+    ## adjustment
+    b <- svdV$u%*%(sqrt(svdV$d)*svdU$u)%*%(1/sqrt(1+svdU$d)/sqrt(svdV$d)*t(svdV$u))
+    K <- tcrossprod(b%*%pv,b)%*%crossprod(C,ri)   # Kalman gain
+    filterMeans[,k] <- fm <- pm+K%*%resid         # filter mean
+    forecast[,k] <- C %*% pm
+    X[,] <- b%*%X+fm[,]
+  }
+  list(filterMeans=filterMeans,predMeans=predMeans,forecast=forecast,condlogLik=condlogLik)
+}
+```
+
+```{r run-eakf}
+eakf <- ensAdjKalmanFilter(y,X0,A,Q,C,R,Np=100)
+```
+
+Plot the results:
+```{r plot-eakf,warning=FALSE}
+melt(list(obs=list(true=y,pred=eakf$forecast),
+          states=list(true=x,filter=eakf$filterMeans,pred=eakf$predMeans))) %>%
+  dcast(vbl+time~L2) %>%
+  ggplot(aes(x=time))+
+  geom_point(aes(y=true),color='black')+
+  geom_point(aes(y=pred),color='red',alpha=0.5)+
+  geom_line(aes(y=filter),color='blue',alpha=0.3)+
+  facet_grid(vbl~.,scales='free_y')+
+  theme(legend.position="top")
+```
+
+## Comparison of likelihoods
+
+```{r comparison3}
+kable(c(enkf=sum(enkf$condlogLik),eakf=sum(eakf$condlogLik),kf=sum(kf$condlogLik),pf=logLik(pf)))
+```
+
+## Effect of ensemble size
+```{r ensemblesize}
+require(foreach)
+require(doMC)
+registerDoMC(30)
+set.seed(181995286L,kind="L'Ecuyer")
+foreach (Np=round(4^seq(3,7,by=1)),
+         .combine=rbind,.inorder=FALSE,
+         .options.multicore=list(set.seed=TRUE,preschedule=FALSE)) %:%
+    foreach (rep=1:5,.combine=rbind) %dopar% 
+    {
+        enkf <- ensembleKalmanFilter(y,X0,A,Q,C,R,Np=Np)
+        eakf <- ensAdjKalmanFilter  (y,X0,A,Q,C,R,Np=Np)
+        pf1 <- pfilter(pf,Np=Np)
+        data.frame(Np=Np,
+                   rep=rep,
+                   enkf=sum(enkf$condlogLik),
+                   eakf=sum(eakf$condlogLik),
+                   pf=logLik(pf1))
+    } %>%
+    melt(id=c("Np","rep"),value.name="logLik",variable.name="method") -> dat
+```
+```{r ensemblesize-plot}
+dat %>% 
+  ggplot(aes(x=Np,y=logLik,color=method))+
+  geom_smooth()+scale_x_log10()+
+  geom_hline(yintercept=sum(kf$condlogLik))+
+  theme_bw()
+```
